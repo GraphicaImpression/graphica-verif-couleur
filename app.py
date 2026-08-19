@@ -153,31 +153,76 @@ def check_is_blank(page):
         return False
 
 
+def check_has_colored_text(page, tolerance=5):
+    """
+    Vérifie si la page contient du texte dont la couleur n'est pas neutre
+    (ni noir, ni gris). Ceci est distinct des images et des formes vectorielles —
+    du texte coloré (ex. un lien bleu, une signature électronique, un titre en
+    couleur) est un objet PDF à part et n'était auparavant jamais vérifié
+    lorsque la page contenait déjà une image.
+    """
+    try:
+        d = page.get_text("dict")
+    except Exception:
+        return False
+
+    for block in d.get("blocks", []):
+        for line in block.get("lines", []):
+            for span in line.get("spans", []):
+                color_int = span.get("color", 0)
+                r = (color_int >> 16) & 255
+                g = (color_int >> 8) & 255
+                b = color_int & 255
+                if max(r, g, b) - min(r, g, b) > tolerance:
+                    return True
+    return False
+
+
+def check_has_colored_vectors(page, tolerance=0.02):
+    """
+    Vérifie si la page contient des formes vectorielles (rectangles, traits,
+    remplissages) dont la couleur n'est pas neutre. IMPORTANT : ceci doit
+    être vérifié sur TOUTE page, pas seulement celles sans image — un plan
+    d'architecte, un tableau ou un diagramme peut avoir une petite image
+    (logo, filigrane) tout en contenant des illustrations vectorielles en
+    couleur ailleurs sur la page. Vérifier les vecteurs seulement en
+    l'absence d'image manquait exactement ce cas.
+    """
+    try:
+        drawings = page.get_drawings()
+    except Exception:
+        return False
+
+    for d in drawings:
+        for key in ("color", "fill"):
+            c = d.get(key)
+            if c and len(c) >= 3:
+                r, g, b = c[0], c[1], c[2]
+                if max(r, g, b) - min(r, g, b) > tolerance:
+                    return True
+    return False
+
+
 def analyze_page(doc, page_index):
     """Analyse une page et retourne son statut couleur / N&B, son format et si elle est blanche."""
     page = doc[page_index]
     rect = page.rect
     fmt_label = get_format_label(rect.width, rect.height)
     is_blank = check_is_blank(page)
+    has_colored_text = check_has_colored_text(page)
+    has_colored_vector = check_has_colored_vectors(page)
     imgs = page.get_images(full=True)
 
     if not imgs:
-        # Page sans image plein format : on se rabat sur les objets vectoriels
-        drawings = page.get_drawings()
-        for d in drawings:
-            for key in ("color", "fill"):
-                c = d.get(key)
-                if c and len(c) >= 3:
-                    r, g, b = c[0], c[1], c[2]
-                    if max(r, g, b) - min(r, g, b) > 0.02:
-                        return {
-                            "page": page_index + 1,
-                            "colorspace": "vector",
-                            "status": "COULEUR",
-                            "colored_pct": None,
-                            "format": fmt_label,
-                            "is_blank": False,
-                        }
+        if has_colored_vector or has_colored_text:
+            return {
+                "page": page_index + 1,
+                "colorspace": "vector/texte",
+                "status": "COULEUR",
+                "colored_pct": None,
+                "format": fmt_label,
+                "is_blank": False,
+            }
         return {
             "page": page_index + 1,
             "colorspace": "aucune image",
@@ -193,13 +238,15 @@ def analyze_page(doc, page_index):
     img_bytes = base["image"]
 
     if cs == "DeviceGray":
+        has_other_color = has_colored_text or has_colored_vector
+        status = "COULEUR" if has_other_color else "N&B"
         return {
             "page": page_index + 1,
-            "colorspace": cs,
-            "status": "N&B",
+            "colorspace": cs if not has_other_color else "DeviceGray + vecteur/texte couleur",
+            "status": status,
             "colored_pct": 0.0,
             "format": fmt_label,
-            "is_blank": is_blank,
+            "is_blank": is_blank and not has_other_color,
         }
 
     try:
@@ -213,7 +260,8 @@ def analyze_page(doc, page_index):
         total_px = arr.shape[0] * arr.shape[1]
         pct = colored_px / total_px * 100
 
-        status = "COULEUR" if colored_px >= MIN_COLORED_PIXELS else "N&B"
+        has_other_color = has_colored_text or has_colored_vector
+        status = "COULEUR" if (colored_px >= MIN_COLORED_PIXELS or has_other_color) else "N&B"
 
         return {
             "page": page_index + 1,
@@ -221,7 +269,7 @@ def analyze_page(doc, page_index):
             "status": status,
             "colored_pct": round(pct, 4),
             "format": fmt_label,
-            "is_blank": is_blank,
+            "is_blank": is_blank and not has_other_color,
         }
     except Exception as e:
         return {
