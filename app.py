@@ -11,12 +11,16 @@ Ce fichier est le backend destiné à être déployé sur Render.
 
 import io
 import os
+import re
+import smtplib
 import tempfile
 import time
 import traceback
+from email.mime.text import MIMEText
 
 import fitz  # PyMuPDF
 import numpy as np
+import requests
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 from PIL import Image
@@ -38,15 +42,118 @@ CORS(app, origins=ALLOWED_ORIGINS)
 MAX_UPLOAD_MB = int(os.environ.get("MAX_UPLOAD_MB", "300"))
 app.config["MAX_CONTENT_LENGTH"] = MAX_UPLOAD_MB * 1024 * 1024
 
+# ---------------------------------------------------------------------------
+# Envoi de courriel (relais SMTP Microsoft 365) — pour le rapport par courriel
+# ---------------------------------------------------------------------------
+SMTP_HOST = os.environ.get("SMTP_HOST", "smtp.office365.com")
+SMTP_PORT = int(os.environ.get("SMTP_PORT", "587"))
+SMTP_USER = os.environ.get("SMTP_USER")          # ex: noreply@graphica.qc.ca
+SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD")  # mot de passe applicatif M365
+FROM_EMAIL = os.environ.get("FROM_EMAIL", SMTP_USER)
+
+# ---------------------------------------------------------------------------
+# Journalisation des analyses (Google Sheet via Apps Script webhook)
+# ---------------------------------------------------------------------------
+SHEET_WEBHOOK_URL = os.environ.get("SHEET_WEBHOOK_URL")  # URL /exec du script
+
+EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+
+def log_to_sheet(action, data):
+    """Best-effort logging to Google Sheet. Never blocks or fails the request."""
+    if not SHEET_WEBHOOK_URL:
+        return
+    try:
+        payload = {"action": action, **data}
+        requests.post(SHEET_WEBHOOK_URL, json=payload, timeout=5)
+    except Exception:
+        # La journalisation ne doit jamais faire planter une vraie requête utilisateur
+        traceback.print_exc()
+
+
+def send_report_email(to_email, filename, total_pages, pages_nb, pages_couleur, ranges):
+    if not SMTP_USER or not SMTP_PASSWORD:
+        raise RuntimeError("Configuration SMTP manquante sur le serveur.")
+
+    pct_couleur = round(pages_couleur / total_pages * 100) if total_pages else 0
+    pct_nb = 100 - pct_couleur
+
+    range_lines = []
+    for r in ranges:
+        label = f"Page {r['start']}" if r["start"] == r["end"] else f"Pages {r['start']}–{r['end']}"
+        count = r["end"] - r["start"] + 1
+        status = "Couleur" if r["status"] == "COULEUR" else "Noir & blanc"
+        range_lines.append(f"  {label} ({count} pages) — {status}")
+
+    body = (
+        f"Voici le rapport d'analyse pour votre document : {filename}\n\n"
+        f"Total des pages : {total_pages}\n"
+        f"Couleur : {pages_couleur} pages ({pct_couleur}%)\n"
+        f"Noir & blanc : {pages_nb} pages ({pct_nb}%)\n\n"
+        f"Répartition par plage de pages :\n" + "\n".join(range_lines) + "\n\n"
+        f"---\n"
+        f"Graphica impression inc. — Cet outil sert d'estimation. "
+        f"La facturation finale est établie par notre équipe de production.\n"
+        f"graphica.qc.ca"
+    )
+
+    msg = MIMEText(body, "plain", "utf-8")
+    msg["Subject"] = f"Votre rapport d'analyse couleur — {filename}"
+    msg["From"] = FROM_EMAIL
+    msg["To"] = to_email
+
+    with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
+        server.starttls()
+        server.login(SMTP_USER, SMTP_PASSWORD)
+        server.sendmail(FROM_EMAIL, [to_email], msg.as_string())
+
 # Seuils de détection (identiques à l'analyse validée manuellement)
 DIFF_THRESHOLD = 12       # écart max-min de canal RGB toléré (bruit JPEG)
 MIN_COLORED_PIXELS = 40   # nombre min de pixels "colorés" avant de conclure COULEUR
 DRAFT_SIZE = (850, 1100)  # taille de décodage rapide (draft JPEG)
+BLANK_NONWHITE_PCT = 0.05  # % de pixels non-blancs en dessous duquel une page est "blanche"
+WHITE_THRESHOLD = 250      # valeur de gris (0-255) au-dessus de laquelle un pixel est "blanc"
+BLANK_CHECK_DPI = 20       # résolution très basse, juste pour détecter une page vide (rapide)
+
+
+def format_dimension(value_in):
+    """Formate une dimension en pouces à la française (virgule, pas de .0 inutile)."""
+    v = round(value_in, 1)
+    if v == int(v):
+        return str(int(v))
+    return f"{v:.1f}".replace(".", ",")
+
+
+def get_format_label(width_pt, height_pt):
+    """Convertit les dimensions de page (points PDF) en étiquette lisible, ex. '8,5 × 11 po'."""
+    width_in = width_pt / 72
+    height_in = height_pt / 72
+    return f"{format_dimension(width_in)} × {format_dimension(height_in)} po"
+
+
+def check_is_blank(page):
+    """
+    Détecte une page vide en rendant la page entière à très basse résolution
+    (rapide — ~0,02s/page) plutôt qu'en décodant l'image intégrale, ce qui
+    capture aussi tout élément vectoriel superposé, pas seulement l'image.
+    """
+    try:
+        pix = page.get_pixmap(dpi=BLANK_CHECK_DPI)
+        arr = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)
+        gray = arr[:, :, :3].mean(axis=2) if pix.n >= 3 else arr[:, :, 0]
+        total_px = gray.shape[0] * gray.shape[1]
+        non_white_px = int((gray < WHITE_THRESHOLD).sum())
+        return (non_white_px / total_px * 100) < BLANK_NONWHITE_PCT
+    except Exception:
+        return False
 
 
 def analyze_page(doc, page_index):
-    """Analyse une page et retourne son statut couleur / N&B."""
+    """Analyse une page et retourne son statut couleur / N&B, son format et si elle est blanche."""
     page = doc[page_index]
+    rect = page.rect
+    fmt_label = get_format_label(rect.width, rect.height)
+    is_blank = check_is_blank(page)
     imgs = page.get_images(full=True)
 
     if not imgs:
@@ -63,12 +170,16 @@ def analyze_page(doc, page_index):
                             "colorspace": "vector",
                             "status": "COULEUR",
                             "colored_pct": None,
+                            "format": fmt_label,
+                            "is_blank": False,
                         }
         return {
             "page": page_index + 1,
             "colorspace": "aucune image",
             "status": "N&B",
             "colored_pct": 0.0,
+            "format": fmt_label,
+            "is_blank": is_blank,
         }
 
     xref = imgs[0][0]
@@ -82,6 +193,8 @@ def analyze_page(doc, page_index):
             "colorspace": cs,
             "status": "N&B",
             "colored_pct": 0.0,
+            "format": fmt_label,
+            "is_blank": is_blank,
         }
 
     try:
@@ -102,6 +215,8 @@ def analyze_page(doc, page_index):
             "colorspace": cs,
             "status": status,
             "colored_pct": round(pct, 4),
+            "format": fmt_label,
+            "is_blank": is_blank,
         }
     except Exception as e:
         return {
@@ -109,6 +224,8 @@ def analyze_page(doc, page_index):
             "colorspace": cs,
             "status": "ERREUR",
             "colored_pct": None,
+            "format": fmt_label,
+            "is_blank": False,
             "error": str(e),
         }
 
@@ -129,6 +246,50 @@ def build_ranges(results):
     if cur_status is not None:
         ranges.append({"start": start, "end": prev, "status": cur_status})
     return ranges
+
+
+def build_format_breakdown(results):
+    """
+    Regroupe les pages par format, avec le compte Couleur / N&B / total / blanches
+    pour chaque format — sert de base au tableau croisé affiché dans l'outil.
+    Les pages blanches restent comptées dans N&B (pas une catégorie de facturation
+    séparée), mais leur nombre est aussi suivi par format pour la note informative.
+    """
+    formats = {}  # format_label -> {couleur, nb, blank}
+    order = []    # préserve l'ordre de première apparition
+
+    for r in results:
+        fmt = r.get("format", "?")
+        if fmt not in formats:
+            formats[fmt] = {"couleur": 0, "nb": 0, "blank": 0}
+            order.append(fmt)
+
+        if r["status"] == "COULEUR":
+            formats[fmt]["couleur"] += 1
+        elif r["status"] == "N&B":
+            formats[fmt]["nb"] += 1
+
+        if r.get("is_blank"):
+            formats[fmt]["blank"] += 1
+
+    breakdown = []
+    for fmt in order:
+        c = formats[fmt]
+        breakdown.append({
+            "format": fmt,
+            "couleur": c["couleur"],
+            "nb": c["nb"],
+            "total": c["couleur"] + c["nb"],
+            "blank": c["blank"],
+        })
+
+    total_blank = sum(c["blank"] for c in formats.values())
+    blank_by_format = [
+        {"format": fmt, "count": formats[fmt]["blank"]}
+        for fmt in order if formats[fmt]["blank"] > 0
+    ]
+
+    return breakdown, total_blank, blank_by_format
 
 
 @app.route("/api/health", methods=["GET"])
@@ -169,7 +330,16 @@ def analyze():
         err = sum(1 for r in results if r["status"] == "ERREUR")
 
         ranges = build_ranges(results)
+        format_breakdown, total_blank, blank_by_format = build_format_breakdown(results)
         elapsed = round(time.time() - t_start, 1)
+
+        log_to_sheet("analyse", {
+            "filename": f.filename,
+            "total_pages": n_pages,
+            "pages_nb": nb,
+            "pages_couleur": coul,
+            "processing_seconds": elapsed,
+        })
 
         return jsonify({
             "filename": f.filename,
@@ -179,6 +349,9 @@ def analyze():
             "pages_erreur": err,
             "processing_seconds": elapsed,
             "ranges": ranges,
+            "format_breakdown": format_breakdown,
+            "total_blank": total_blank,
+            "blank_by_format": blank_by_format,
             "pages": results,
         })
 
@@ -191,6 +364,37 @@ def analyze():
             os.remove(tmp_path)
         except OSError:
             pass
+
+
+@app.route("/api/send-report", methods=["POST"])
+def send_report():
+    data = request.get_json(silent=True) or {}
+
+    email = (data.get("email") or "").strip()
+    if not email or not EMAIL_RE.match(email):
+        return jsonify({"error": "Adresse courriel invalide."}), 400
+
+    filename = data.get("filename", "document.pdf")
+    total_pages = data.get("total_pages", 0)
+    pages_nb = data.get("pages_nb", 0)
+    pages_couleur = data.get("pages_couleur", 0)
+    ranges = data.get("ranges", [])
+
+    try:
+        send_report_email(email, filename, total_pages, pages_nb, pages_couleur, ranges)
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({"error": f"Impossible d'envoyer le courriel : {str(e)}"}), 500
+
+    log_to_sheet("envoi_courriel", {
+        "filename": filename,
+        "total_pages": total_pages,
+        "pages_nb": pages_nb,
+        "pages_couleur": pages_couleur,
+        "email": email,
+    })
+
+    return jsonify({"success": True})
 
 
 if __name__ == "__main__":
