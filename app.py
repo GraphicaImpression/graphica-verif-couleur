@@ -125,10 +125,15 @@ def format_dimension(value_in):
 
 
 def get_format_label(width_pt, height_pt):
-    """Convertit les dimensions de page (points PDF) en étiquette lisible, ex. '8,5 × 11 po'."""
+    """
+    Convertit les dimensions de page (points PDF) en étiquette lisible, ex. '8,5 × 11 po'.
+    Normalise l'ordre (plus petite dimension en premier) pour qu'une même feuille
+    physique en orientation portrait ou paysage produise toujours la même étiquette.
+    """
     width_in = width_pt / 72
     height_in = height_pt / 72
-    return f"{format_dimension(width_in)} × {format_dimension(height_in)} po"
+    short, long = sorted([width_in, height_in])
+    return f"{format_dimension(short)} × {format_dimension(long)} po"
 
 
 def check_is_blank(page):
